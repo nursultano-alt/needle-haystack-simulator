@@ -39,9 +39,10 @@ float3 _BoxMin;
 float3 _BoxMax;
 
 // Interaction
-uint _GrabbedIndex;
-float3 _HandPos;
+int _GrabbedIndex;
+float3 _GrabTargetPos;
 float _HandForce;
+int _NeedleIndex;
 float3 _SiftRayOrigin;
 float3 _SiftRayDir;
 float _SiftRadius;
@@ -190,15 +191,22 @@ void CS_Integrate(uint3 id : SV_DispatchThreadID)
 
     StrawData s = _StrawBuffer[id.x];
 
-    if (s.state == 1) // Grabbed by player
+    // Smoothly pull toward target position with spring-damper if grabbed
+    if (_GrabbedIndex >= 0 && (int)id.x == _GrabbedIndex)
     {
-        // Smoothly pull toward target position with spring-damper
+        s.state = 1;
+        s.targetPos = _GrabTargetPos;
         float3 toTarget = s.targetPos - s.position;
         s.velocity = toTarget * 24.0;
         s.angularVelocity *= 0.85;
         s.position += s.velocity * _DeltaTime;
         _StrawBuffer[id.x] = s;
         return;
+    }
+    else if (s.state == 1 && (int)id.x != _GrabbedIndex)
+    {
+        // Released from grab
+        s.state = ((int)id.x == _NeedleIndex) ? 2 : 0;
     }
 
     // Apply gravity
@@ -369,7 +377,7 @@ void CS_BuildMatrices(uint3 id : SV_DispatchThreadID)
     float3 scale = (id.x < _ActiveCount) ? float3(s.radius / 0.0065, s.length / 0.36, s.radius / 0.0065) : float3(0, 0, 0);
     
     // Golden Needle visual scale override
-    if (s.state == 2)
+    if (s.state == 2 || (_NeedleIndex >= 0 && (int)id.x == _NeedleIndex))
     {
         scale = float3(1.1, 1.1, 1.1);
     }
