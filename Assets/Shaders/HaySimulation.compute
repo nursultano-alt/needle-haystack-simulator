@@ -1,0 +1,379 @@
+#pragma kernel CS_InitStraws
+#pragma kernel CS_EmitStraw
+#pragma kernel CS_Integrate
+#pragma kernel CS_SolveCollisions
+#pragma kernel CS_SolveInteraction
+#pragma kernel CS_BuildMatrices
+
+struct StrawData
+{
+    float3 position;
+    float radius;
+    float4 rotation; // Quaternion (x, y, z, w)
+    float3 velocity;
+    float length;
+    float3 angularVelocity;
+    float mass;
+    float4 color;
+    uint state; // 0 = free, 1 = grabbed, 2 = needle
+    float3 targetPos;
+    float padding;
+};
+
+RWStructuredBuffer<StrawData> _StrawBuffer;
+RWStructuredBuffer<float4x4> _TransformBuffer;
+RWStructuredBuffer<float4> _ColorBuffer;
+
+uint _MaxStraws;
+uint _ActiveCount;
+float _DeltaTime;
+float3 _Gravity;
+float _LinearDrag;
+float _AngularDrag;
+float _Restitution;
+float _Friction;
+float _TanglingFriction;
+
+// Boundary Box (Barn Crate)
+float3 _BoxMin;
+float3 _BoxMax;
+
+// Interaction
+uint _GrabbedIndex;
+float3 _HandPos;
+float _HandForce;
+float3 _SiftRayOrigin;
+float3 _SiftRayDir;
+float _SiftRadius;
+float _SiftStrength;
+uint _IsSifting;
+
+// Emission parameters
+uint _EmitStartIndex;
+uint _EmitCount;
+float3 _EmitOrigin;
+float3 _EmitVelocity;
+float _EmitConeAngle;
+float _EmitStrawLength;
+float _EmitStrawRadius;
+float4 _EmitColor;
+uint _Seed;
+
+// PRNG
+float Hash11(float p)
+{
+    p = frac(p * 0.1031);
+    p *= p + 33.33;
+    p *= p + p;
+    return frac(p);
+}
+
+float3 Hash31(float p)
+{
+    float3 p3 = frac(float3(p, p, p) * float3(0.1031, 0.1030, 0.0973));
+    p3 += dot(p3, p3.yzx + 33.33);
+    return frac((p3.xxy + p3.yzz) * p3.zyx);
+}
+
+// Quaternion helpers
+float4 QuatMultiply(float4 q1, float4 q2)
+{
+    return float4(
+        q1.w * q2.xyz + q2.w * q1.xyz + cross(q1.xyz, q2.xyz),
+        q1.w * q2.w - dot(q1.xyz, q2.xyz)
+    );
+}
+
+float3 QuatRotate(float4 q, float3 v)
+{
+    return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v);
+}
+
+float4 QuatFromAxisAngle(float3 axis, float angle)
+{
+    float halfAngle = angle * 0.5;
+    float s = sin(halfAngle);
+    return float4(normalize(axis) * s, cos(halfAngle));
+}
+
+float4x4 MatrixFromTRS(float3 pos, float4 q, float3 scale)
+{
+    float x = q.x, y = q.y, z = q.z, w = q.w;
+    float x2 = x + x, y2 = y + y, z2 = z + z;
+    float xx = x * x2, xy = x * y2, xz = x * z2;
+    float yy = y * y2, yz = y * z2, zz = z * z2;
+    float wx = w * x2, wy = w * y2, wz = w * z2;
+
+    float4x4 m;
+    m[0] = float4((1.0 - (yy + zz)) * scale.x, (xy + wz) * scale.x, (xz - wy) * scale.x, 0.0);
+    m[1] = float4((xy - wz) * scale.y, (1.0 - (xx + zz)) * scale.y, (yz + wx) * scale.y, 0.0);
+    m[2] = float4((xz + wy) * scale.z, (yz - wx) * scale.z, (1.0 - (xx + yy)) * scale.z, 0.0);
+    m[3] = float4(pos, 1.0);
+    return m;
+}
+
+[numthreads(64, 1, 1)]
+void CS_InitStraws(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _MaxStraws) return;
+
+    StrawData s;
+    s.position = float3(0.0, -100.0, 0.0); // park inactive straws deep underground
+    s.radius = 0.007;
+    s.rotation = float4(0, 0, 0, 1);
+    s.velocity = float3(0, 0, 0);
+    s.length = 0.36;
+    s.angularVelocity = float3(0, 0, 0);
+    s.mass = 0.015;
+    s.color = float4(0.85, 0.72, 0.38, 1.0);
+    s.state = 0;
+    s.targetPos = float3(0, 0, 0);
+    s.padding = 0.0;
+
+    _StrawBuffer[id.x] = s;
+}
+
+[numthreads(64, 1, 1)]
+void CS_EmitStraw(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _EmitCount) return;
+    uint index = _EmitStartIndex + id.x;
+    if (index >= _MaxStraws) return;
+
+    float seed = float(_Seed + id.x * 1973);
+    float3 rnd1 = Hash31(seed);
+    float3 rnd2 = Hash31(seed + 41.13);
+
+    // Spread cone
+    float spreadAngle = _EmitConeAngle * (rnd1.x - 0.5);
+    float spreadAngle2 = _EmitConeAngle * (rnd1.y - 0.5);
+    float3 forward = normalize(_EmitVelocity);
+    float3 right = normalize(cross(forward, float3(0, 1, 0.001)));
+    float3 up = cross(right, forward);
+    float3 dir = normalize(forward + right * spreadAngle + up * spreadAngle2);
+
+    float speed = length(_EmitVelocity) * (0.8 + 0.4 * rnd1.z);
+
+    StrawData s;
+    s.position = _EmitOrigin + (rnd2.xyz - 0.5) * 0.15;
+    s.radius = _EmitStrawRadius * (0.85 + 0.3 * rnd1.y);
+    s.length = _EmitStrawLength * (0.85 + 0.3 * rnd2.x);
+    
+    // Random 3D rotation
+    float3 randAxis = normalize(rnd2 - 0.5 + 0.001);
+    s.rotation = QuatFromAxisAngle(randAxis, rnd1.x * 6.28318);
+
+    s.velocity = dir * speed;
+    s.angularVelocity = (rnd1 - 0.5) * 16.0; // tumble upon pouring
+    s.mass = 0.012;
+    
+    // Natural color variations: golden yellow, pale straw, sun dried
+    float cVar = (rnd2.y - 0.5) * 0.18;
+    s.color = float4(
+        saturate(_EmitColor.r + cVar),
+        saturate(_EmitColor.g + cVar * 0.8),
+        saturate(_EmitColor.b + cVar * 0.4),
+        1.0
+    );
+
+    s.state = 0;
+    s.targetPos = s.position;
+    s.padding = 0.0;
+
+    _StrawBuffer[index] = s;
+}
+
+[numthreads(64, 1, 1)]
+void CS_Integrate(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _ActiveCount) return;
+
+    StrawData s = _StrawBuffer[id.x];
+
+    if (s.state == 1) // Grabbed by player
+    {
+        // Smoothly pull toward target position with spring-damper
+        float3 toTarget = s.targetPos - s.position;
+        s.velocity = toTarget * 24.0;
+        s.angularVelocity *= 0.85;
+        s.position += s.velocity * _DeltaTime;
+        _StrawBuffer[id.x] = s;
+        return;
+    }
+
+    // Apply gravity
+    s.velocity += _Gravity * _DeltaTime;
+
+    // Apply linear and angular damping
+    s.velocity *= max(0.0, 1.0 - _LinearDrag * _DeltaTime);
+    s.angularVelocity *= max(0.0, 1.0 - _AngularDrag * _DeltaTime);
+
+    // Integrate position
+    s.position += s.velocity * _DeltaTime;
+
+    // Integrate rotation
+    float angSpeed = length(s.angularVelocity);
+    if (angSpeed > 0.0001)
+    {
+        float3 axis = s.angularVelocity / angSpeed;
+        float4 dq = QuatFromAxisAngle(axis, angSpeed * _DeltaTime);
+        s.rotation = normalize(QuatMultiply(dq, s.rotation));
+    }
+
+    _StrawBuffer[id.x] = s;
+}
+
+[numthreads(64, 1, 1)]
+void CS_SolveCollisions(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _ActiveCount) return;
+
+    StrawData s = _StrawBuffer[id.x];
+    if (s.state == 1) return; // grabbed item handled by interactor
+
+    float halfL = s.length * 0.5;
+    float3 axisY = QuatRotate(s.rotation, float3(0, 1, 0));
+    float3 tipA = s.position + axisY * halfL;
+    float3 tipB = s.position - axisY * halfL;
+
+    // Floor collision (Barn floor at _BoxMin.y)
+    float floorY = _BoxMin.y + s.radius;
+    float lowestY = min(tipA.y, tipB.y);
+    if (lowestY < floorY)
+    {
+        float pen = floorY - lowestY;
+        s.position.y += pen;
+        if (s.velocity.y < 0.0)
+        {
+            s.velocity.y = -s.velocity.y * _Restitution;
+            // Floor friction
+            s.velocity.xz *= max(0.0, 1.0 - _Friction * 5.0 * _DeltaTime);
+            s.angularVelocity *= max(0.0, 1.0 - _Friction * 8.0 * _DeltaTime);
+        }
+    }
+
+    // Container Side Walls (Barn Crate XZ)
+    // Left/Right walls
+    if (s.position.x - halfL < _BoxMin.x)
+    {
+        s.position.x = _BoxMin.x + halfL;
+        if (s.velocity.x < 0) s.velocity.x = -s.velocity.x * _Restitution;
+    }
+    else if (s.position.x + halfL > _BoxMax.x)
+    {
+        s.position.x = _BoxMax.x - halfL;
+        if (s.velocity.x > 0) s.velocity.x = -s.velocity.x * _Restitution;
+    }
+
+    // Front/Back walls
+    if (s.position.z - halfL < _BoxMin.z)
+    {
+        s.position.z = _BoxMin.z + halfL;
+        if (s.velocity.z < 0) s.velocity.z = -s.velocity.z * _Restitution;
+    }
+    else if (s.position.z + halfL > _BoxMax.z)
+    {
+        s.position.z = _BoxMax.z - halfL;
+        if (s.velocity.z > 0) s.velocity.z = -s.velocity.z * _Restitution;
+    }
+
+    // Inter-Straw Interaction: Fast Local Spatial Sampling
+    // Check neighboring straws in the buffer to create fiber interlocking and stacking
+    uint checkRange = 24; // Check local window of straws
+    uint start = (id.x >= checkRange) ? (id.x - checkRange) : 0;
+    uint end = min(_ActiveCount, id.x + checkRange);
+
+    for (uint j = start; j < end; j++)
+    {
+        if (j == id.x) continue;
+        StrawData other = _StrawBuffer[j];
+
+        float3 delta = s.position - other.position;
+        float distSq = dot(delta, delta);
+        float minDist = s.radius + other.radius + 0.004;
+        float interactDist = (s.length + other.length) * 0.45;
+
+        if (distSq < interactDist * interactDist && distSq > 0.000001)
+        {
+            float dist = sqrt(distSq);
+            float3 dir = delta / dist;
+
+            // Contact push force when overlapping
+            if (dist < minDist)
+            {
+                float pen = minDist - dist;
+                float3 push = dir * (pen * 0.5);
+                s.position += push;
+                s.velocity += push * 12.0;
+                
+                // Tangling friction: resistance to sliding across each other
+                float3 relVel = s.velocity - other.velocity;
+                float3 tangentVel = relVel - dot(relVel, dir) * dir;
+                s.velocity -= tangentVel * (_TanglingFriction * 0.5);
+                s.angularVelocity *= 0.95;
+            }
+            else
+            {
+                // Soft interlocking resistance (straws resting on one another)
+                float overlap = 1.0 - (dist / interactDist);
+                s.velocity.y += overlap * 0.12; // buoyancy from underlying straw density
+                s.angularVelocity *= (1.0 - overlap * 0.08);
+            }
+        }
+    }
+
+    _StrawBuffer[id.x] = s;
+}
+
+[numthreads(64, 1, 1)]
+void CS_SolveInteraction(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _ActiveCount) return;
+
+    StrawData s = _StrawBuffer[id.x];
+
+    // Right-Click Sifting / Digging Hands / Pitchfork Interaction
+    if (_IsSifting == 1)
+    {
+        // Distance from straw center to sifting ray
+        float3 w = s.position - _SiftRayOrigin;
+        float proj = dot(w, _SiftRayDir);
+        if (proj > 0.0)
+        {
+            float3 closestPointOnRay = _SiftRayOrigin + _SiftRayDir * proj;
+            float3 rayToStraw = s.position - closestPointOnRay;
+            float radialDist = length(rayToStraw);
+
+            if (radialDist < _SiftRadius && radialDist > 0.001)
+            {
+                float3 outwardDir = rayToStraw / radialDist;
+                float factor = 1.0 - (radialDist / _SiftRadius);
+                // Push straws outward away from the pitchfork/hands
+                s.velocity += (outwardDir * 1.5 + float3(0, 0.8, 0)) * (_SiftStrength * factor * _DeltaTime * 40.0);
+                s.angularVelocity += cross(outwardDir, float3(0, 1, 0)) * (factor * 15.0);
+            }
+        }
+    }
+
+    _StrawBuffer[id.x] = s;
+}
+
+[numthreads(64, 1, 1)]
+void CS_BuildMatrices(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _MaxStraws) return;
+
+    StrawData s = _StrawBuffer[id.x];
+
+    // If straw is inactive, scale to zero so it's culled
+    float3 scale = (id.x < _ActiveCount) ? float3(s.radius / 0.0065, s.length / 0.36, s.radius / 0.0065) : float3(0, 0, 0);
+    
+    // Golden Needle visual scale override
+    if (s.state == 2)
+    {
+        scale = float3(1.1, 1.1, 1.1);
+    }
+
+    _TransformBuffer[id.x] = MatrixFromTRS(s.position, s.rotation, scale);
+    _ColorBuffer[id.x] = s.color;
+}
